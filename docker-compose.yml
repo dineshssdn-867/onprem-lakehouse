@@ -1,0 +1,308 @@
+version: "3.9"
+
+services:
+
+  postgresql:
+    image: postgres:15
+    container_name: postgresql
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgresql/init-polaris-db.sql:/docker-entrypoint-initdb.d/01-init-polaris-db.sql:ro
+      - ./postgresql/init-superset-db.sql:/docker-entrypoint-initdb.d/02-init-superset-db.sql:ro
+    ports:
+      - "5432:5432"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d polaris"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - data_network
+
+  minio:
+    hostname: minio
+    image: "minio/minio"
+    container_name: minio
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    command: [ "server", "/data", "--console-address", ":9001" ]
+    volumes:
+      - ./docker-volumes/minio/data:/data
+    env_file:
+      - .env
+    networks:
+      data_network:
+        aliases:
+          - lakehouse.minio
+          - mlflow.minio
+          - raw-data.minio
+
+  polaris-admin:
+    image: apache/polaris-admin-tool:latest
+    container_name: polaris-admin
+    volumes:
+      - ./polaris/admin-application.properties:/home/polaris/config/application.properties:ro
+    command:
+      - bootstrap
+      - --realm=POLARIS
+      - -c=POLARIS,${POLARIS_CLIENT_ID:-polaris},${POLARIS_CLIENT_SECRET:-polaris_secret_123}
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    networks:
+      - data_network
+
+  polaris:
+    image: apache/polaris:latest
+    container_name: polaris
+    ports:
+      - "8181:8181"
+    environment:
+      - AWS_ACCESS_KEY_ID=minio
+      - AWS_SECRET_ACCESS_KEY=minio123
+      - AWS_REGION=us-east-1
+      - AWS_ENDPOINT_URL_S3=http://minio:9000
+      - AWS_ENDPOINT_URL_STS=http://minio:9000
+      - POLARIS_BOOTSTRAP_CREDENTIALS=POLARIS,${POLARIS_CLIENT_ID:-polaris},${POLARIS_CLIENT_SECRET:-polaris_secret_123}
+    volumes:
+      - ./polaris/application.properties:/deployments/config/application.properties:ro
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      polaris-admin:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8182/q/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - data_network
+
+  polaris-bootstrap:
+    build:
+      context: ./polaris
+      dockerfile: Dockerfile
+    container_name: polaris-bootstrap
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      - POLARIS_CLIENT_ID=${POLARIS_CLIENT_ID:-polaris}
+      - POLARIS_CLIENT_SECRET=${POLARIS_CLIENT_SECRET:-polaris_secret_123}
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${AWS_ACCESS_KEY_ID:-minio}
+      - MINIO_SECRET_KEY=${AWS_SECRET_ACCESS_KEY:-minio123}
+    depends_on:
+      polaris:
+        condition: service_healthy
+    networks:
+      - data_network
+    restart: on-failure
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/etc:/etc/trino
+      - ./trino/catalog:/etc/trino/catalog
+    depends_on:
+      polaris:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - data_network
+
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: ./Dockerfile
+    container_name: "spark-master"
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_NO_DAEMONIZE=true
+    command: /opt/spark/sbin/start-master.sh
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    depends_on:
+      polaris:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - data_network
+
+  spark-worker-1:
+    build:
+      context: ./spark
+      dockerfile: ./Dockerfile
+    container_name: "spark-worker-1"
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=2
+      - SPARK_NO_DAEMONIZE=true
+      - AWS_REGION=us-east-1
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    depends_on:
+      - spark-master
+    networks:
+      - data_network
+
+  spark-worker-2:
+    build:
+      context: ./spark
+      dockerfile: ./Dockerfile
+    container_name: "spark-worker-2"
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=2
+      - SPARK_NO_DAEMONIZE=true
+      - AWS_REGION=us-east-1
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    depends_on:
+      - spark-master
+    networks:
+      - data_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - data_network
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    command: ["/app/superset-init.sh"]
+    ports:
+      - "8088:8088"
+    environment:
+      - SUPERSET_CONFIG_PATH=/app/superset_config.py
+    env_file:
+      - .env
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      trino:
+        condition: service_started
+    networks:
+      - data_network
+
+  superset-worker:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset-worker
+    command: ["/app/superset-worker.sh"]
+    environment:
+      - SUPERSET_CONFIG_PATH=/app/superset_config.py
+    env_file:
+      - .env
+    depends_on:
+      - superset
+      - redis
+    networks:
+      - data_network
+
+  mlflow:
+    build:
+      context: ./mlflow
+      dockerfile: Dockerfile
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - PORT=5000
+      - FILE_DIR=/mlflow
+      - AWS_BUCKET=mlflow
+      - PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+    depends_on:
+      - postgresql
+      - minio
+    networks:
+      - data_network
+
+  model_serving:
+    build:
+      context: ./model_server
+      dockerfile: Dockerfile
+    container_name: recommender_model
+    ports:
+      - "5001:5001"
+    env_file:
+      - .env
+    volumes:
+      - ./model_server/main.py:/opt/mlflow/main.py
+    environment:
+      - AWS_BUCKET=mlflow
+      - FILE_DIR=/mlflow
+    depends_on:
+      - mlflow
+      - minio
+    networks:
+      - data_network
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: recommender_app
+    ports:
+      - "8051:8051"
+    environment:
+      - PYTHONPATH=/home/app
+      - TRINO_HOST=trino
+      - TRINO_PORT=8080
+      - MODEL_SERVER_HOST=recommender_model
+      - MODEL_SERVER_PORT=5001
+      - MINIO_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY=minio
+      - AWS_SECRET_KEY=minio123
+    volumes:
+      - ./app:/home/app
+    depends_on:
+      - trino
+      - model_serving
+    networks:
+      - data_network
+
+
+volumes:
+  pgdata:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  data_network:
+    driver: bridge
+    name: data_network

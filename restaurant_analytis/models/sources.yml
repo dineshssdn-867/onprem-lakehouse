@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: lakehouse
+    schema: bronze
+    tables:
+      - name: restaurant
+      - name: user
+      - name: review
+      - name: checkin
+      - name: tip
+  - name: dev_silver
+    database: lakehouse
+    schema: dev_silver
+    tables:
+      - name: fact_review
+      - name: dim_user
+      - name: dim_restaurant

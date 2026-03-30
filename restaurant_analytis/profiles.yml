@@ -1,0 +1,12 @@
+restaurant_analytis:
+  outputs:
+    dev:
+      type: trino
+      method: none
+      host: localhost
+      port: 8080
+      user: trino
+      catalog: lakehouse
+      schema: dev
+      threads: 6
+  target: dev
